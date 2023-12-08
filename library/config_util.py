@@ -64,12 +64,19 @@ class BaseSubsetParams:
   caption_tag_dropout_rate: float = 0.0
   token_warmup_min: int = 1
   token_warmup_step: float = 0
+  template_file_name: str = None,
+  caption_template:str = None
+  replacements: list = list[Tuple[str,str]]
 
 @dataclass
 class DreamBoothSubsetParams(BaseSubsetParams):
   is_reg: bool = False
   class_tokens: Optional[str] = None
   caption_extension: str = ".caption"
+  tag_extension: str = ".tags"
+  template_file_name: str = None,
+  caption_template: str = None
+  replacements: list = list[Tuple[str,str]]
 
 @dataclass
 class FineTuningSubsetParams(BaseSubsetParams):
@@ -96,6 +103,7 @@ class DreamBoothDatasetParams(BaseDatasetParams):
   bucket_reso_steps: int = 64
   bucket_no_upscale: bool = False
   prior_loss_weight: float = 1.0
+
 
 @dataclass
 class FineTuningDatasetParams(BaseDatasetParams):
@@ -164,12 +172,16 @@ class ConfigSanitizer:
     "token_warmup_step": Any(float,int),
     "caption_prefix": str,
     "caption_suffix": str,
+    "template_file_name": str,
+    "caption_template":str,
+    "replacements": list
   }
   # DO means DropOut
   DO_SUBSET_ASCENDABLE_SCHEMA = {
     "caption_dropout_every_n_epochs": int,
     "caption_dropout_rate": Any(float, int),
     "caption_tag_dropout_rate": Any(float, int),
+    "tag_extension": str
   }
   # DB means DreamBooth
   DB_SUBSET_ASCENDABLE_SCHEMA = {
@@ -472,6 +484,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
           random_crop: {subset.random_crop}
           token_warmup_min: {subset.token_warmup_min},
           token_warmup_step: {subset.token_warmup_step},
+          replacements: {subset.replacements},
       """), "  ")
 
       if is_dreambooth:
@@ -479,6 +492,9 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
           is_reg: {subset.is_reg}
           class_tokens: {subset.class_tokens}
           caption_extension: {subset.caption_extension}
+          tag_extension: {subset.tag_extension}
+          template_file_name: {subset.template_file_name}
+          caption_template: {subset.caption_template}
         \n"""), "    ")
       elif not is_controlnet:
         info += indent(dedent(f"""\

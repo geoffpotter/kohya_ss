@@ -556,6 +556,15 @@ def train(args):
                     noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
 
                 target = noise
+                
+                if args.masked_loss and batch["masks"] is not None:
+                    mask = batch["masks"].to(noise_pred.device).reshape(noise_pred.shape[0], 1, noise_pred.shape[2] * 8, noise_pred.shape[3] * 8)
+                    mask = torch.nn.functional.interpolate(mask.float(), size=noise_pred.shape[-2:], mode="nearest")
+
+                    #mask = mask / mask.mean()
+                    mask = torch.pow(mask,2) * 2 + 0.3
+                    noise_pred = noise_pred * mask
+                    target = target * mask
 
                 if (
                     args.min_snr_gamma

@@ -124,10 +124,11 @@ TEXT_ENCODER_OUTPUTS_CACHE_SUFFIX = "_te_outputs.npz"
 
 
 class ImageInfo:
-    def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
+    def __init__(self, image_key: str, num_repeats: int, caption: str, tags: str, is_reg: bool, absolute_path: str) -> None:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
         self.caption: str = caption
+        self.tags: str = tags
         self.is_reg: bool = is_reg
         self.absolute_path: str = absolute_path
         self.image_size: Tuple[int, int] = None
@@ -140,6 +141,7 @@ class ImageInfo:
         self.latents_crop_ltrb: Tuple[int, int] = None  # crop left top right bottom in original pixel size, not latents size
         self.cond_img_path: str = None
         self.image: Optional[Image.Image] = None  # optional, original PIL Image
+        self.mask: np.ndarray = None
         # SDXL, optional
         self.text_encoder_outputs_npz: Optional[str] = None
         self.text_encoder_outputs1: Optional[torch.Tensor] = None
@@ -362,6 +364,10 @@ class BaseSubset:
         caption_suffix: Optional[str],
         token_warmup_min: int,
         token_warmup_step: Union[float, int],
+        
+        replacements: list,
+        template_file_name: str = None,
+        caption_template:str = None
     ) -> None:
         self.image_dir = image_dir
         self.num_repeats = num_repeats
@@ -382,6 +388,10 @@ class BaseSubset:
         self.token_warmup_step = token_warmup_step  # N（N<1ならN*max_train_steps）ステップ目でタグの数が最大になる
 
         self.img_count = 0
+        
+        self.caption_template = caption_template
+        self.template_file_name = template_file_name
+        self.replacements = replacements
 
 
 class DreamBoothSubset(BaseSubset):
@@ -391,6 +401,8 @@ class DreamBoothSubset(BaseSubset):
         is_reg: bool,
         class_tokens: Optional[str],
         caption_extension: str,
+        tag_extension: str,
+        template_file_name: str,
         num_repeats,
         shuffle_caption,
         caption_separator: str,
@@ -406,6 +418,8 @@ class DreamBoothSubset(BaseSubset):
         caption_suffix,
         token_warmup_min,
         token_warmup_step,
+        replacements: list,
+        caption_template:str = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -426,10 +440,19 @@ class DreamBoothSubset(BaseSubset):
             caption_suffix,
             token_warmup_min,
             token_warmup_step,
+            replacements,
+            template_file_name,
+            caption_template,
         )
 
         self.is_reg = is_reg
         self.class_tokens = class_tokens
+        
+
+        self.tag_extension = tag_extension
+        if self.tag_extension and not self.tag_extension.startswith("."):
+            self.tag_extension = "." + self.tag_extension
+
         self.caption_extension = caption_extension
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension
@@ -651,43 +674,80 @@ class BaseDataset(torch.utils.data.Dataset):
         )
 
         if is_drop_out:
-            caption = ""
+            # print("dropping caption")
+            return ""
+
+        captions = imageInfo.caption.split('\n')
+        if len(captions) == 1: # if there's only one line, assume the captions are split by commas
+            caption = captions[0].split(",")
+            caption = random.choice(caption)
         else:
-            if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
-                tokens = [t.strip() for t in caption.strip().split(subset.caption_separator)]
-                if subset.token_warmup_step < 1:  # 初回に上書きする
-                    subset.token_warmup_step = math.floor(subset.token_warmup_step * self.max_train_steps)
-                if subset.token_warmup_step and self.current_step < subset.token_warmup_step:
-                    tokens_len = (
-                        math.floor((self.current_step) * ((len(tokens) - subset.token_warmup_min) / (subset.token_warmup_step)))
-                        + subset.token_warmup_min
-                    )
-                    tokens = tokens[:tokens_len]
+            caption = random.choice(captions)
+        
 
-                def dropout_tags(tokens):
-                    if subset.caption_tag_dropout_rate <= 0:
-                        return tokens
-                    l = []
-                    for token in tokens:
-                        if random.random() >= subset.caption_tag_dropout_rate:
-                            l.append(token)
-                    return l
+        if imageInfo.tags is None:
+            tags = caption.split(',')
+        else:
+            tags = imageInfo.tags
 
-                fixed_tokens = []
-                flex_tokens = tokens[:]
-                if subset.keep_tokens > 0:
-                    fixed_tokens = flex_tokens[: subset.keep_tokens]
-                    flex_tokens = tokens[subset.keep_tokens :]
+        templates = subset.caption_template.split('\n')
+        template = random.choice(templates)
+        if subset.shuffle_caption or subset.token_warmup_step > 0 or subset.caption_tag_dropout_rate > 0:
+            tokens = [t.strip() for t in tags.strip().split(subset.caption_separator)]
+            if subset.token_warmup_step < 1:  # 初回に上書きする
+                subset.token_warmup_step = math.floor(subset.token_warmup_step * self.max_train_steps)
+            if subset.token_warmup_step and self.current_step < subset.token_warmup_step:
+                tokens_len = (
+                    math.floor((self.current_step) * ((len(tokens) - subset.token_warmup_min) / (subset.token_warmup_step)))
+                    + subset.token_warmup_min
+                )
+                tokens = tokens[:tokens_len]
 
-                if subset.shuffle_caption:
-                    random.shuffle(flex_tokens)
+            def dropout_tags(tokens):
+                if subset.caption_tag_dropout_rate <= 0:
+                    return tokens
+                l = []
+                for token in tokens:
+                    if random.random() >= subset.caption_tag_dropout_rate:
+                        l.append(token)
+                return l
 
-                flex_tokens = dropout_tags(flex_tokens)
+            fixed_tokens = []
+            flex_tokens = tokens[:]
+            if subset.keep_tokens > 0:
+                fixed_tokens = flex_tokens[: subset.keep_tokens]
+                flex_tokens = tokens[subset.keep_tokens :]
 
-                caption = ", ".join(fixed_tokens + flex_tokens)
+            if subset.shuffle_caption:
+                random.shuffle(flex_tokens)
 
-            # textual inversion対応
-            for str_from, str_to in self.replacements.items():
+            flex_tokens = dropout_tags(flex_tokens)
+
+            tags = ", ".join(fixed_tokens + flex_tokens)
+        
+        if caption is None:
+            caption = ""
+        if tags is None:
+            tags = ""
+
+        # print('making caption:', caption, tags)
+        caption = self.transform_template(template, caption, tags, subset, imageInfo)
+        
+        
+        # textual inversion対応
+        for str_from, str_to in self.replacements.items():
+            if str_from == "":
+                # replace all
+                if type(str_to) == list:
+                    caption = random.choice(str_to)
+                else:
+                    caption = str_to
+            else:
+                caption = caption.replace(str_from, str_to)
+
+        # config replacements
+        if isinstance(subset.replacements, list):
+            for str_from, str_to in subset.replacements:
                 if str_from == "":
                     # replace all
                     if type(str_to) == list:
@@ -697,7 +757,19 @@ class BaseDataset(torch.utils.data.Dataset):
                 else:
                     caption = caption.replace(str_from, str_to)
 
+
+        # print(subset.__dict__)
+        # print("\nprocessed caption: ", caption)
         return caption
+
+    def transform_template(self, template: str, caption: str, tags: str, subset: BaseSubset, imageInfo: ImageInfo):
+        dirName = os.path.dirname(subset.image_dir)
+        template = template.replace("[dirname]", dirName)
+        template = template.replace("[caption]", caption)
+        template = template.replace("[tags]", tags)
+        if isinstance(subset, DreamBoothSubset):
+            template = template.replace("[class_tokens]", subset.class_tokens)
+        return template
 
     def get_input_ids(self, caption, tokenizer=None):
         if tokenizer is None:
@@ -1075,6 +1147,7 @@ class BaseDataset(torch.utils.data.Dataset):
         input_ids2_list = []
         latents_list = []
         images = []
+        masks = []
         original_sizes_hw = []
         crop_top_lefts = []
         target_sizes_hw = []
@@ -1094,16 +1167,28 @@ class BaseDataset(torch.utils.data.Dataset):
             if image_info.latents is not None:  # cache_latents=Trueの場合
                 original_size = image_info.latents_original_size
                 crop_ltrb = image_info.latents_crop_ltrb  # calc values later if flipped
+                mask = image_info.mask
                 if not flipped:
                     latents = image_info.latents
                 else:
                     latents = image_info.latents_flipped
+                    mask = torch.flip(mask, dims=[1])
 
                 image = None
             elif image_info.latents_npz is not None:  # FineTuningDatasetまたはcache_latents_to_disk=Trueの場合
-                latents, original_size, crop_ltrb, flipped_latents = load_latents_from_disk(image_info.latents_npz)
+                latents, original_size, crop_ltrb, flipped_latents, mask = load_latents_from_disk(image_info.latents_npz)
+                if mask is not None:
+                    mask = torch.FloatTensor(mask)
+                elif image_info.mask is None:
+                    print("shouldn't be here!!!!")
+                    mask = load_mask(image_info.absolute_path)
+                    mask = trim_and_resize_mask_to_image(mask, image_info.resized_size, image_info.bucket_reso)
+                    mask = torch.from_numpy(mask)
+                else:
+                    mask = image_info.mask
                 if flipped:
                     latents = flipped_latents
+                    mask = torch.flip(mask, dims=[1])
                     del flipped_latents
                 latents = torch.FloatTensor(latents)
 
@@ -1112,6 +1197,8 @@ class BaseDataset(torch.utils.data.Dataset):
                 # 画像を読み込み、必要ならcropする
                 img, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(subset, image_info.absolute_path)
                 im_h, im_w = img.shape[0:2]
+                mask = load_mask(image_info.absolute_path)
+                img[..., -1] = mask
 
                 if self.enable_bucket:
                     img, original_size, crop_ltrb = trim_and_resize_if_required(
@@ -1147,10 +1234,14 @@ class BaseDataset(torch.utils.data.Dataset):
                 if flipped:
                     img = img[:, ::-1, :].copy()  # copy to avoid negative stride problem
 
+                mask = img[:, :, -1] / 255
+                img = img[:, :, :3]
                 latents = None
                 image = self.image_transforms(img)  # -1.0~1.0のtorch.Tensorになる
+                mask = torch.from_numpy(mask)
 
             images.append(image)
+            masks.append(mask)
             latents_list.append(latents)
 
             target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
@@ -1182,7 +1273,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 text_encoder_pool2_list.append(text_encoder_pool2)
                 captions.append(caption)
             else:
-                caption = self.process_caption(subset, image_info.caption)
+                caption = self.process_caption(subset, image_info)
                 if self.XTI_layers:
                     caption_layer = []
                     for layer in self.XTI_layers:
@@ -1243,10 +1334,10 @@ class BaseDataset(torch.utils.data.Dataset):
         else:
             images = None
         example["images"] = images
+        example["masks"] = torch.stack(masks) if masks[0] is not None else None
 
         example["latents"] = torch.stack(latents_list) if latents_list[0] is not None else None
         example["captions"] = captions
-
         example["original_sizes_hw"] = torch.stack([torch.LongTensor(x) for x in original_sizes_hw])
         example["crop_top_lefts"] = torch.stack([torch.LongTensor(x) for x in crop_top_lefts])
         example["target_sizes_hw"] = torch.stack([torch.LongTensor(x) for x in target_sizes_hw])
@@ -1361,6 +1452,9 @@ class DreamBoothDataset(BaseDataset):
             self.bucket_reso_steps = None  # この情報は使われない
             self.bucket_no_upscale = False
 
+
+
+        
         def read_caption(img_path, caption_extension):
             # captionの候補ファイル名を作る
             base_name = os.path.splitext(img_path)[0]
@@ -1379,38 +1473,83 @@ class DreamBoothDataset(BaseDataset):
                         except UnicodeDecodeError as e:
                             print(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
                             raise e
-                        assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
-                        caption = lines[0].strip()
+                        print(f"caption file is empty / キャプションファイルが空です: {cap_path}")
+                        #assert len(lines) > 0, f"caption file is empty / キャプションファイルが空です: {cap_path}"
+                        if len(lines) > 0:
+                            caption = lines[0].strip()
+                        else:
+                            caption = ""
                     break
             return caption
+        def read_template(img_dir, template_file_name):
+            print('reading template:', img_dir, template_file_name)
+            if template_file_name is None or template_file_name is tuple:
+                return None
+            local_path = os.path.join(img_dir, template_file_name)
+            cap_path = None
+            if os.path.isfile(template_file_name):
+                cap_path = template_file_name
+            elif os.path.isfile(local_path):
+                cap_path = local_path
+            
+            print(template_file_name, os.path.isfile(template_file_name))
+            print(local_path, os.path.isfile(local_path))
+            print(cap_path)
 
+            if not cap_path is None and os.path.isfile(cap_path):
+                with open(cap_path, "rt", encoding="utf-8") as f:
+                    try:
+                        lines = f.read()
+                    except UnicodeDecodeError as e:
+                        print(f"illegal char in file (not UTF-8) / ファイルにUTF-8以外の文字があります: {cap_path}")
+                        raise e
+                    assert len(lines) > 0, f"template file is empty / キャプションファイルが空です: {cap_path}"
+                    template = lines
+
+                return template
+            return None
+        
         def load_dreambooth_dir(subset: DreamBoothSubset):
             if not os.path.isdir(subset.image_dir):
-                print(f"not directory: {subset.image_dir}")
-                return [], []
+                print(f"not a directory: {subset.image_dir}")
+                return [], [], []
 
             img_paths = glob_images(subset.image_dir, "*")
             print(f"found directory {subset.image_dir} contains {len(img_paths)} image files")
 
             # 画像ファイルごとにプロンプトを読み込み、もしあればそちらを使う
             captions = []
+            tags = []
             missing_captions = []
             for img_path in img_paths:
                 cap_for_img = read_caption(img_path, subset.caption_extension)
+                if not subset.tag_extension:
+                    tags_for_img = cap_for_img # no extension, use cap
+                else:
+                    tags_for_img = read_caption(img_path, subset.tag_extension)
+                    if not tags_for_img:
+                        tags_for_img = cap_for_img # file doesn't exist, or is empty, use cap
+                
+                if cap_for_img is None and not tags_for_img is None:
+                    cap_for_img = tags_for_img
+
                 if cap_for_img is None and subset.class_tokens is None:
                     print(
                         f"neither caption file nor class tokens are found. use empty caption for {img_path} / キャプションファイルもclass tokenも見つかりませんでした。空のキャプションを使用します: {img_path}"
                     )
                     captions.append("")
+                    tags.append("")
                     missing_captions.append(img_path)
                 else:
                     if cap_for_img is None:
                         captions.append(subset.class_tokens)
+                        tags.append(subset.class_tokens)
                         missing_captions.append(img_path)
                     else:
                         captions.append(cap_for_img)
+                        tags.append(tags_for_img)
 
-            self.set_tag_frequency(os.path.basename(subset.image_dir), captions)  # タグ頻度を記録
+            self.set_tag_frequency(os.path.basename(subset.image_dir), tags + captions)  # タグ頻度を記録
 
             if missing_captions:
                 number_of_missing_captions = len(missing_captions)
@@ -1425,7 +1564,8 @@ class DreamBoothDataset(BaseDataset):
                         print(missing_caption + f"... and {remaining_missing_captions} more")
                         break
                     print(missing_caption)
-            return img_paths, captions
+            #print("returning: captions:", captions, "tags:", tags)
+            return img_paths, captions, tags
 
         print("prepare images.")
         num_train_images = 0
@@ -1443,8 +1583,16 @@ class DreamBoothDataset(BaseDataset):
                     f"ignore duplicated subset with image_dir='{subset.image_dir}': use the first one / 既にサブセットが登録されているため、重複した後発のサブセットを無視します"
                 )
                 continue
+            if not subset.template_file_name is None:
+                loadedTemplate = read_template(subset.image_dir, subset.template_file_name)
+                if not loadedTemplate is None:
+                    subset.caption_template = loadedTemplate
+            if subset.caption_template is None:
+                subset.caption_template = "[caption]"
 
-            img_paths, captions = load_dreambooth_dir(subset)
+            
+
+            img_paths, captions, tags = load_dreambooth_dir(subset)
             if len(img_paths) < 1:
                 print(f"ignore subset with image_dir='{subset.image_dir}': no images found / 画像が見つからないためサブセットを無視します")
                 continue
@@ -1454,8 +1602,8 @@ class DreamBoothDataset(BaseDataset):
             else:
                 num_train_images += subset.num_repeats * len(img_paths)
 
-            for img_path, caption in zip(img_paths, captions):
-                info = ImageInfo(img_path, subset.num_repeats, caption, subset.is_reg, img_path)
+            for img_path, caption, tags in zip(img_paths, captions, tags):
+                info = ImageInfo(img_path, subset.num_repeats, caption, tags, subset.is_reg, img_path)
                 if subset.is_reg:
                     reg_infos.append(info)
                 else:
@@ -1490,7 +1638,10 @@ class DreamBoothDataset(BaseDataset):
                 first_loop = False
 
         self.num_reg_images = num_reg_images
-
+    def transform_template(self, template, caption: str, tags: str, subset: DreamBoothSubset, imageInfo: ImageInfo):
+        template = super().transform_template(template, caption, tags, subset, imageInfo)
+        template = template.replace("[class_tokens]", subset.class_tokens)
+        return template
 
 class FineTuningDataset(BaseDataset):
     def __init__(
@@ -1720,6 +1871,7 @@ class ControlNetDataset(BaseDataset):
                 False,
                 None,
                 subset.caption_extension,
+                subset.tag_extension,
                 subset.num_repeats,
                 subset.shuffle_caption,
                 subset.keep_tokens,
@@ -1965,13 +2117,16 @@ def load_latents_from_disk(
     original_size = npz["original_size"].tolist()
     crop_ltrb = npz["crop_ltrb"].tolist()
     flipped_latents = npz["latents_flipped"] if "latents_flipped" in npz else None
-    return latents, original_size, crop_ltrb, flipped_latents
+    masks = npz['mask']
+    return latents, original_size, crop_ltrb, flipped_latents, masks
 
 
-def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, flipped_latents_tensor=None):
+def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, flipped_latents_tensor=None, mask_tensor = None):
     kwargs = {}
     if flipped_latents_tensor is not None:
         kwargs["latents_flipped"] = flipped_latents_tensor.float().cpu().numpy()
+    if mask_tensor is not None:
+        kwargs["mask"] = mask_tensor
     np.savez(
         npz_path,
         latents=latents_tensor.float().cpu().numpy(),
@@ -2157,10 +2312,73 @@ def load_arbitrary_dataset(args, tokenizer) -> MinimalDataset:
 
 def load_image(image_path):
     image = Image.open(image_path)
-    if not image.mode == "RGB":
-        image = image.convert("RGB")
-    img = np.array(image, np.uint8)
+    if not image.mode == "RGBA":
+        image = image.convert("RGBA")
+        img = np.array(image, np.uint8)
+        img[..., -1] = load_mask(image_path)
+    else:
+        img = np.array(image, np.uint8)
+    
     return img
+
+def load_mask(path):
+    #print("loading mask for:", path)
+    try:
+        p = pathlib.Path(path)
+        mask_path = os.path.join(p.parent, 'mask', p.stem + '.png')
+        if os.path.exists(mask_path):
+            mask = np.array(Image.open(mask_path))
+        else:
+            img = Image.open(path)
+            if img.mode == "RGBA":
+                mask = np.array(img)
+                mask = mask[:, :, 3]
+            else:
+                mask = None
+            
+        if mask is None:
+            print(f"{mask_path} has no mask data: Defaulting to no mask")
+            return np.ones_like(np.array(Image.open(path).convert("L"))) * 255
+
+        if len(mask.shape) > 2 and mask.max() <= 255:
+            #print(path, "reloading")
+            #print(mask.shape)
+            return np.array(Image.open(mask_path).convert("L"))
+        elif len(mask.shape) == 2 and mask.max() > 255:
+            #print(path, "scaling")
+            #print(mask.max())
+            return mask // (((2 ** 16) - 1) // 255)
+        elif len(mask.shape) == 2 and mask.max() <= 255:
+            #print(path, "using")
+            return mask
+        else:
+            print(f"{mask_path} has invalid mask format: Defaulting to no mask")
+            return np.ones_like(np.array(Image.open(path).convert("L"))) * 255
+    except:
+        print(f"{mask_path} not found: Defaulting to no mask")
+        pass
+    return np.ones_like(np.array(Image.open(path).convert("L"))) * 255
+
+def trim_and_resize_mask_to_image(
+    mask: np.ndarray, resized_size, bucket_reso
+) -> np.ndarray:
+    mask_height, mask_width = mask.shape[0:2]
+
+    if mask_width != resized_size[0] or mask_height != resized_size[1]:
+        mask = cv2.resize(mask, resized_size, interpolation=cv2.INTER_AREA)
+
+    mask_height, mask_width = mask.shape[0:2]
+
+    if mask_width > bucket_reso[0]:
+        trim_size = mask_width - bucket_reso[0]
+        p = trim_size // 2
+        mask = mask[:, p : p + bucket_reso[0]]
+    if mask_height > bucket_reso[1]:
+        trim_size = mask_height - bucket_reso[1]
+        p = trim_size // 2
+        mask = mask[p : p + bucket_reso[1]]
+
+    return mask
 
 
 # 画像を読み込む。戻り値はnumpy.ndarray,(original width, original height),(crop left, crop top, crop right, crop bottom)
@@ -2210,11 +2428,17 @@ def cache_batch_latents(
     """
     images = []
     for info in image_infos:
-        image = load_image(info.absolute_path) if info.image is None else np.array(info.image, np.uint8)
+        image = load_image(image_path=info.absolute_path) if info.image is None else np.array(info.image, np.uint8)
+        mask = image[:,:,3]
+        image = image[:,:,:3]
         # TODO 画像のメタデータが壊れていて、メタデータから割り当てたbucketと実際の画像サイズが一致しない場合があるのでチェック追加要
         image, original_size, crop_ltrb = trim_and_resize_if_required(random_crop, image, info.bucket_reso, info.resized_size)
         image = IMAGE_TRANSFORMS(image)
         images.append(image)
+
+        mask = trim_and_resize_mask_to_image(mask, info.resized_size, info.bucket_reso)
+        mask = torch.from_numpy(mask)
+        info.mask = mask
 
         info.latents_original_size = original_size
         info.latents_crop_ltrb = crop_ltrb
@@ -2238,7 +2462,7 @@ def cache_batch_latents(
             raise RuntimeError(f"NaN detected in latents: {info.absolute_path}")
 
         if cache_to_disk:
-            save_latents_to_disk(info.latents_npz, latent, info.latents_original_size, info.latents_crop_ltrb, flipped_latent)
+            save_latents_to_disk(info.latents_npz, latent, info.latents_original_size, info.latents_crop_ltrb, flipped_latent, info.mask)
         else:
             info.latents = latent
             if flip_aug:
@@ -2247,6 +2471,12 @@ def cache_batch_latents(
     # FIXME this slows down caching a lot, specify this as an option
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    # for info in image_infos:
+    #     mask = load_mask(info.absolute_path)
+    #     mask = trim_and_resize_mask_to_image(mask, info.resized_size, info.bucket_reso)
+    #     mask = torch.from_numpy(mask)
+    #     info.mask = mask
 
 
 def cache_batch_text_encoder_outputs(
@@ -3192,6 +3422,8 @@ def add_dataset_arguments(
     parser.add_argument(
         "--bucket_no_upscale", action="store_true", help="make bucket for each image without upscaling / 画像を拡大せずbucketを作成します"
     )
+
+    parser.add_argument("--masked_loss", action="store_true", help="Enable Masked Loss from Mask File")
 
     parser.add_argument(
         "--token_warmup_min",

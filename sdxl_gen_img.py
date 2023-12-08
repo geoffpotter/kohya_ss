@@ -1355,6 +1355,9 @@ class BatchData(NamedTuple):
 
 
 def main(args):
+    
+    created_image_paths = list[str]
+
     if args.fp16:
         dtype = torch.float16
     elif args.bf16:
@@ -2234,7 +2237,9 @@ def main(args):
                 else:
                     fln = f"im_{ts_str}_{highres_prefix}{i:03d}_{seed}.png"
 
-                image.save(os.path.join(args.outdir, fln), pnginfo=metadata)
+                img_path = os.path.join(args.outdir, fln)
+                created_image_paths.append(img_path)
+                image.save(img_path, pnginfo=metadata)
 
             if not args.no_preview and not highres_1st and args.interactive:
                 try:
@@ -2554,6 +2559,10 @@ def main(args):
             batch_data.clear()
 
     print("done!")
+    if __name__ != "__main__":
+        return created_image_paths
+
+
 
 
 def setup_parser() -> argparse.ArgumentParser:
