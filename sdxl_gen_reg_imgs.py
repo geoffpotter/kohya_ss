@@ -1,21 +1,22 @@
-# 手元で推論を行うための最低限のコード。HuggingFace／DiffusersのCLIP、schedulerとVAEを使う
-# Minimal code for performing inference at local. Use HuggingFace/Diffusers CLIP, scheduler and VAE
+# This script will create the caption text files in the specified folder using the specified file pattern and caption text.
+#
+# eg: python caption.py D:\some\folder\location "*.png, *.jpg, *.webp" "some caption text"
 
 import argparse
+import random
+# import glob
+from pathlib import Path
+from typing import Any
+from PIL import Image
+from sdxl_gen_img import main as GenImages, setup_parser as setup_gen_parser
+
+
 import datetime
 import math
 import os
-import random
 from einops import repeat
 import numpy as np
 import torch
-try:
-    import intel_extension_for_pytorch as ipex
-    if torch.xpu.is_available():
-        from library.ipex import ipex_init
-        ipex_init()
-except Exception:
-    pass
 from tqdm import tqdm
 from transformers import CLIPTokenizer
 from diffusers import EulerDiscreteScheduler
@@ -32,7 +33,6 @@ SCHEDULER_LINEAR_START = 0.00085
 SCHEDULER_LINEAR_END = 0.0120
 SCHEDULER_TIMESTEPS = 1000
 SCHEDLER_SCHEDULE = "scaled_linear"
-
 
 # Time EmbeddingはDiffusersからのコピー
 # Time Embedding is copied from Diffusers
@@ -72,42 +72,15 @@ def get_timestep_embedding(x, outdim):
     return emb
 
 
-if __name__ == "__main__":
+def getMakeImage(ckpt_path, steps = 50, guidance_scale = 7, crop_top = 0, crop_left = 0):
     # 画像生成条件を変更する場合はここを変更 / change here to change image generation conditions
 
     # SDXLの追加のvector embeddingへ渡す値 / Values to pass to additional vector embedding of SDXL
-    target_height = 1024
-    target_width = 1024
-    original_height = target_height
-    original_width = target_width
-    crop_top = 0
-    crop_left = 0
-
-    steps = 50
-    guidance_scale = 7
-    seed = None  # 1
-
     DEVICE = "cuda"
     DTYPE = torch.float16  # bfloat16 may work
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt_path", type=str, required=True)
-    parser.add_argument("--prompt", type=str, default="A photo of a cat")
-    parser.add_argument("--prompt2", type=str, default=None)
-    parser.add_argument("--negative_prompt", type=str, default="")
-    parser.add_argument("--output_dir", type=str, default=".")
-    parser.add_argument(
-        "--lora_weights",
-        type=str,
-        nargs="*",
-        default=[],
-        help="LoRA weights, only supports networks.lora, each argument is a `path;multiplier` (semi-colon separated)",
-    )
-    parser.add_argument("--interactive", action="store_true")
-    args = parser.parse_args()
 
-    if args.prompt2 is None:
-        args.prompt2 = args.prompt
+
 
     # HuggingFaceのmodel id
     text_encoder_1_name = "openai/clip-vit-large-patch14"
@@ -119,7 +92,7 @@ if __name__ == "__main__":
     # 本体RAMが少ない場合はGPUにロードするといいかも
     # If the main RAM is small, it may be better to load it on the GPU
     text_model1, text_model2, vae, unet, _, _ = sdxl_model_util.load_models_from_sdxl_checkpoint(
-        sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, args.ckpt_path, "cpu"
+        sdxl_model_util.MODEL_VERSION_SDXL_BASE_V0_9, ckpt_path, "cpu"
     )
 
     # Text Encoder 1はSDXL本体でもHuggingFaceのものを使っている
@@ -160,18 +133,18 @@ if __name__ == "__main__":
     tokenizer1 = CLIPTokenizer.from_pretrained(text_encoder_1_name)
     tokenizer2 = lambda x: open_clip.tokenize(x, context_length=77)
 
-    # LoRA
-    for weights_file in args.lora_weights:
-        if ";" in weights_file:
-            weights_file, multiplier = weights_file.split(";")
-            multiplier = float(multiplier)
-        else:
-            multiplier = 1.0
+    # # LoRA
+    # for weights_file in args.lora_weights:
+    #     if ";" in weights_file:
+    #         weights_file, multiplier = weights_file.split(";")
+    #         multiplier = float(multiplier)
+    #     else:
+    #         multiplier = 1.0
 
-        lora_model, weights_sd = lora.create_network_from_weights(
-            multiplier, weights_file, vae, [text_model1, text_model2], unet, None, True
-        )
-        lora_model.merge_to([text_model1, text_model2], unet, weights_sd, DTYPE, DEVICE)
+    #     lora_model, weights_sd = lora.create_network_from_weights(
+    #         multiplier, weights_file, vae, [text_model1, text_model2], unet, None, True
+    #     )
+    #     lora_model.merge_to([text_model1, text_model2], unet, weights_sd, DTYPE, DEVICE)
 
     # scheduler
     scheduler = EulerDiscreteScheduler(
@@ -181,7 +154,18 @@ if __name__ == "__main__":
         beta_schedule=SCHEDLER_SCHEDULE,
     )
 
-    def generate_image(prompt, prompt2, negative_prompt, seed=None):
+    def generate_image(output_dir, image_name, prompt, prompt2, negative_prompt, target_width, target_height, original_width=None, original_height=None, seed=None):
+
+        if original_height is None:
+            original_height = target_height
+        if original_width is None:
+            original_width = target_width
+
+        if prompt2 is None:
+            prompt2 = prompt
+        
+        if negative_prompt is None:
+            negative_prompt = ""
         # 将来的にサイズ情報も変えられるようにする / Make it possible to change the size information in the future
         # prepare embedding
         with torch.no_grad():
@@ -220,7 +204,7 @@ if __name__ == "__main__":
                 enc_out = text_model2(tokens, output_hidden_states=True, return_dict=True)
                 text_embedding2_penu = enc_out["hidden_states"][-2]
                 # print("hidden_states2", text_embedding2_penu.shape)
-                text_embedding2_pool = enc_out["text_embeds"]   # do not support Textual Inversion
+                text_embedding2_pool = enc_out["text_embeds"]
 
             # 連結して終了 concat and finish
             text_embedding = torch.cat([text_embedding1, text_embedding2_penu], dim=2)
@@ -303,26 +287,154 @@ if __name__ == "__main__":
 
         # 保存して終了 save and finish
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        saved_paths = []
         for i, img in enumerate(image):
-            img.save(os.path.join(args.output_dir, f"image_{timestamp}_{i:03d}.png"))
+            if image_name is None:
+                image_name = f"image_{timestamp}_{i:03d}.png"
+            image_path = os.path.join(output_dir, image_name)
+            img.save(image_path)
+            saved_paths.append(image_path)
 
-    if not args.interactive:
-        generate_image(args.prompt, args.prompt2, args.negative_prompt, seed)
+        return saved_paths
+
+
+
+    return generate_image
+
+
+def create_caption_files(ckpt, base_folder: str, file_pattern: str, caption_file_ext: str, tag_file_ext: str, overwrite: bool):
+    # Split the file patterns string and strip whitespace from each pattern
+    patterns = [pattern.strip() for pattern in file_pattern.split(",")]
+
+    # Create a Path object for the image folder
+    folder = Path(base_folder)
+
+    makeImages = getMakeImage("E:\stuff\stable-diffusion-webui\models\Stable-diffusion\sd_xl_base_1.0.safetensors", 50)
+    # Iterate over the file patterns
+    for pattern in patterns:
+        # Use the glob method to match the file patterns
+        files = folder.glob(pattern)
+
+        # Iterate over the matched files
+        for idx, file in enumerate(files):
+            if file.parent.name.endswith("_reg"):
+                continue
+            # Check if a text file with the same name as the current file exists in the folder
+            # Open the image file
+            cap_file = file.with_suffix(caption_file_ext)
+            tag_file = file.with_suffix(tag_file_ext)
+            img = Image.open(file)
+            caps = []
+            if cap_file.exists():
+                caps = cap_file.read_text(encoding='utf-8').split('\n') 
+            if len(caps) == 1: # if there's only one line, assume the captions are split by commas
+                caps = caps[0].split(",")
+            
+            tags = []
+            if tag_file.exists():
+                tags = tag_file.read_text(encoding='utf-8').split(",")
+            reg_dir = Path(file.parent.as_posix() + "_reg")
+
+            if not reg_dir.is_dir():
+                print("making reg directory:", reg_dir)
+                reg_dir.mkdir()
+            
+
+            width = img.width
+            height = img.height
+            # width = 1208
+            # height = 888
+            # print(width, height)
+            aspect = float(width) / float(height)
+            # print(aspect)
+            if aspect > 1: #wide
+                width = 1024
+                height = int(1024 * (1 / aspect))
+            else: #tall
+                width = int(1024 * aspect)
+                height = 1024
+
+            if height % 64 != 0:
+                height -= height % 64
+            if width % 64 != 0:
+                width -= width % 64
+            
+            base_file_name = file.with_suffix("").name
+            # print(width, height)
+            # return
+            for itr in range(5):
+                fileName = base_file_name + "_reg_" + str(itr) + ".png"
+                if Path(reg_dir, fileName).exists():
+                    print("reg file exists, skipping", Path(reg_dir, fileName))
+                    continue
+                ourTags = random.choices(tags, k=5)
+                ourCap = random.choice(caps)
+                prompt = ourCap + ", " + ",".join(ourTags)
+                created_paths = makeImages(reg_dir, fileName, prompt, prompt, "illustration, drawing, painting", width, height)
+                for created_path in created_paths:
+                    this_cap_file = Path(created_path).with_suffix(caption_file_ext)
+                    this_cap_file.write_text(prompt)
+
+            
+            
+
+            # if not txt_file.exists() or overwrite:
+            #     # Create a text file with the caption text in the folder, if it does not already exist
+            #     # or if the overwrite argument is True
+            #     with open(txt_file, "w") as f:
+            #         f.write(caption_text)
+
+def main():
+    # Define command-line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_folder", type=str, help="the folder where the image files are located")
+    parser.add_argument("--file_pattern", type=str, default="**/*.png, **/*.jpg, **/*.jpeg, **/*.webp", help="the pattern to match the image file names")
+    parser.add_argument("--caption_file_ext", type=str, default=".captions", help="the caption file extension.")
+    parser.add_argument("--tag_file_ext", type=str, default=".tags", help="the caption file extension.")
+    parser.add_argument("--overwrite", action="store_true", default=False, help="whether to overwrite existing caption files")
+
+    # Create a mutually exclusive group for the caption_text and caption_file arguments
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--caption_text", type=str, help="the text to include in the caption files")
+    group.add_argument("--caption_file", type=argparse.FileType("r"), help="the file containing the text to include in the caption files")
+    
+    parser.add_argument("--ckpt", type=str, default=None, help="path to checkpoint of model / モデルのcheckpointファイルまたはディレクトリ")
+    
+
+    # Parse the command-line arguments
+    args = parser.parse_args()
+    base_folder = args.base_folder
+    file_pattern = args.file_pattern
+    caption_file_ext = args.caption_file_ext
+    tag_file_ext = args.tag_file_ext
+    overwrite = args.overwrite
+    ckpt = args.ckpt
+
+    # Get the caption text from either the caption_text or caption_file argument
+    if args.caption_text:
+        caption_text = args.caption_text
+    elif args.caption_file:
+        caption_text = args.caption_file.read()
     else:
-        # loop for interactive
-        while True:
-            prompt = input("prompt: ")
-            if prompt == "":
-                break
-            prompt2 = input("prompt2: ")
-            if prompt2 == "":
-                prompt2 = prompt
-            negative_prompt = input("negative prompt: ")
-            seed = input("seed: ")
-            if seed == "":
-                seed = None
-            else:
-                seed = int(seed)
-            generate_image(prompt, prompt2, negative_prompt, seed)
+        caption_text = ""
 
-    print("Done!")
+    # Create a Path object for the image folder
+    folder = Path(base_folder)
+
+    # Check if the image folder exists and is a directory
+    if not folder.is_dir():
+        raise ValueError(f"{base_folder} is not a valid directory.")
+        
+    # Create the caption files
+    create_caption_files(ckpt, base_folder, file_pattern, caption_file_ext, tag_file_ext, overwrite)
+
+# python sdxl_gen_reg_imgs.py --ckpt "E:\stuff\stable-diffusion-webui\models\Stable-diffusion\sd_xl_base_1.0.safetensors" --base_folder "E:\stuff\New folder\datasets\geoffp"
+
+
+# "python sdxl_minimal_inference.py --prompt "a man" --prompt2 "suit" --negative_prompt "drawing" --ckpt_path E:\stuff\stable-diffusion-webui\models\Stable-diffusion\sd_xl_base_1.0.safetensors"
+
+if __name__ == "__main__":
+    main()
+
+
+
